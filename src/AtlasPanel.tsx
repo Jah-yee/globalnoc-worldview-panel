@@ -188,9 +188,14 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
           for (const map of atlasObj) {
             map.metadata.mb_url = url;
             map.metadata.grafana_alias = name;
+
             atlas.addTopology(map);
 
-            setData();
+            // Wait for topology to be ready before applying data
+            setTimeout(() => {
+              setData();
+            }, 100);
+
             if (!display) {
               atlas.hideTopology(map.name);
             }
@@ -199,7 +204,9 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
         } else {
           console.log('Bailing This Request');
         }
-      } catch (error) {}
+      } catch (error) {
+        console.error('Error loading map from URL:', url, error);
+      }
     }
   }
 
@@ -216,6 +223,7 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
     let reinforceView = this.reinforceView.bind(this);
     let setData = this.setTopologyData.bind(this);
     let { lat, lng } = this.props.options.mapView;
+
     try {
       topology = JSON.parse(customMapJSON.content);
     } catch (e) {
@@ -224,6 +232,7 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
 
     let editorButton = document.querySelector('.atlas-toggle-editor') as HTMLAnchorElement;
     editorButton.style.display = '';
+
     if (topology) {
       // Disable Atlas Editor
       atlas.editor.disableAllModes();
@@ -235,6 +244,7 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
       // Remove all existing topologies and add new one
       atlas.removeAllTopologies();
       console.log(topology);
+
       if (Array.isArray(topology)) {
         for (const topo of topology) {
           atlas.addTopology(topo);
@@ -243,11 +253,14 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
         atlas.addTopology(topology);
       }
 
-      try {
-        setData();
-      } catch (error) {
-        console.log('Could not set data :(');
-      }
+      // IMPORTANT: Wait a tick for topology to be fully added before applying data
+      setTimeout(() => {
+        try {
+          setData();
+        } catch (error) {
+          console.log('Could not set data :(', error);
+        }
+      }, 100);
 
       reinforceView(lat, lng);
     }
@@ -403,25 +416,133 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
     }
   }
 
+  addDataToCircuits() {
+    //console.error('NewCODE');
+    const { atlas } = this.state;
+    if (!atlas) {
+      return;
+    }
+    if (!dataValues || dataValues.length === 0) {
+      return;
+    }
+
+    atlas.applyData(dataValues);
+
+    try {
+      for (const t in atlas.topologies) {
+        const topology = atlas.topologies[t];
+
+        topology.lines.forEach((line: any) => {
+          try {
+            const dataTargets = line.metadata?.data_targets;
+
+            if (!dataTargets || !Array.isArray(dataTargets) || dataTargets.length === 0) {
+              return;
+            }
+
+            let inputValue: number | null = null;
+            let outputValue: number | null = null;
+
+            // Process all data targets for this line
+            dataTargets.forEach((targetName: string) => {
+              const matchingData = dataValues.find((dv: any) => dv.data_target === targetName);
+
+              if (matchingData && matchingData.values && matchingData.values.length > 0) {
+                const latestValue = matchingData.values[matchingData.values.length - 1];
+
+                if (latestValue && latestValue[1] !== undefined) {
+                  const value = latestValue[1];
+
+                  // Use aggregate_group to determine if this is input or output
+                  const aggregateGroup = matchingData.aggregate_group?.toLowerCase() || '';
+
+                  if (aggregateGroup.includes('input') || aggregateGroup.includes('in')) {
+                    inputValue = value;
+
+                    // Use input for line coloring
+                    line.appliedData = {
+                      now: value,
+                      aggregate_group: matchingData.aggregate_group,
+                    };
+                  } else if (aggregateGroup.includes('output') || aggregateGroup.includes('out')) {
+                    outputValue = value;
+                  }
+                }
+              }
+            });
+
+            // Set dataValues with both input and output
+            line.dataValues = {
+              input: {
+                now: inputValue,
+              },
+              output: {
+                now: outputValue,
+              },
+            };
+
+            // Get units from legend configuration
+            const units = atlas.legends?.lines?.units || '';
+
+            // Format values - check if they look like bandwidth or just counts
+            const formatValue = (value: number | null) => {
+              if (value === null) {
+                return 'N/A';
+              }
+
+              // If value is very large (> 1000) and units contain bps/bit, auto-convert
+              if (value >= 1000 && (units.toLowerCase().includes('bps') || units.toLowerCase().includes('bit'))) {
+                if (value >= 1000000000) {
+                  return `${(value / 1000000000).toFixed(2)} Gbps`;
+                } else if (value >= 1000000) {
+                  return `${(value / 1000000).toFixed(2)} Mbps`;
+                } else if (value >= 1000) {
+                  return `${(value / 1000).toFixed(2)} Kbps`;
+                }
+              }
+
+              // For small values or non-bandwidth metrics, show raw number without unit conversion
+              if (value < 1000 || !units.toLowerCase().includes('bps')) {
+                return value.toFixed(0); // Show as whole number for counts
+              }
+
+              // Default: show with original unit
+              return units ? `${value.toFixed(2)} ${units}` : value.toFixed(2);
+            };
+
+            // Update tooltip HTML
+            if (line.tooltip && line.tooltip.html) {
+              line.tooltip.html = line.tooltip.html
+                .replace(/\$dataValues\.input\.now/g, formatValue(inputValue))
+                .replace(/\$dataValues\.output\.now/g, formatValue(outputValue));
+            }
+          } catch (err) {
+            console.error('Error processing line:', err);
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Error in data application:', err);
+    }
+
+    this.setDataMappingOptions();
+  }
+
   setTopologyData() {
     let { data } = this.props;
-    console.log('DATA', data);
+
     // Only create a new data dictionary if data is fetched again
     if (data.state === 'Done' && lastDataDictionaryCreated !== data.request!.requestId) {
       this.createDataDictionary();
     }
-
     this.addDataToCircuits();
   }
 
-  addDataToCircuits() {
-    console.log('ADD DATA TO CIRCUITS', dataValues);
-    this.state.atlas.applyData(dataValues);
-    this.setDataMappingOptions();
-  }
+  // And update createDataDictionary to have better logging:
 
   createDataDictionary() {
     let { series, request } = this.props.data;
+
     lastDataDictionaryCreated = request!.requestId;
     dataValues = [];
 
@@ -437,6 +558,7 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
     for (const data of series) {
       try {
         let data_target: string = data.name!;
+
         let speeds = data.fields[1].values.toArray().reverse() as number[];
         let timestamps = data.fields[0].values.toArray().reverse() as number[];
 
@@ -467,14 +589,16 @@ export class AtlasPanel extends Component<Props, AtlasPanelState> {
             values,
             aggregate_group,
           });
-        }
+        } //else {
+        //   console.error('No matching aggregate_group');
+        // }
       } catch (error) {
+        console.error('ERROR processing series:', error);
         dataValues = [];
         return;
       }
     }
   }
-
   getMapSelectorClass(): string[] {
     // @ts-ignore
     window.atlas = this.state.atlas;
